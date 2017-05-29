@@ -7,12 +7,14 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import arp
+from ryu.lib.packet import ipv6
 from ryu.lib.packet import ether_types
 from ryu.lib import mac
- 
-from ryu.topology.api import get_switch, get_link
+
 from ryu.app.wsgi import ControllerBase
-from ryu.topology import event, switches
+from ryu.topology import event
+from ryu.topology import switches
 from collections import defaultdict
  
 #switches
@@ -27,13 +29,10 @@ adjacency=defaultdict(lambda:defaultdict(lambda:None))
 def minimum_distance(distance, Q):
 	min = float('Inf')
 	node = 0
-	print distance
 	for v in Q:
-		print v
 		if distance[v] < min:
 			min = distance[v]
 			node = v
-	print node
 	return node
  
 def get_path (src,dst,first_port,final_port):
@@ -52,10 +51,7 @@ def get_path (src,dst,first_port,final_port):
 
 	while len(Q)>0:
 		u = minimum_distance(distance, Q)
-		try:
-			Q.remove(u)
-		except:
-			pass
+		Q.remove(u)
 
 		for p in switches:
 			if adjacency[u][p]!=None:
@@ -100,41 +96,57 @@ class ProjectController(app_manager.RyuApp):
 		super(ProjectController, self).__init__(*args, **kwargs)
 		self.mac_to_port = {}
 		self.topology_api_app = self
-		self.datapath_list=[]
+		self.datapath_list = {}
 	
 	# Handy function that lists all attributes in the given object
 	def ls(self,obj):
 		print("\n".join([x for x in dir(obj) if x[0] != "_"]))
  
-	def add_flow(self, datapath, in_port, dst, actions):
+	def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+		print "this is called succesfulyy"
 		ofproto = datapath.ofproto
-		parser = datapath.ofproto_parser      
-		match = datapath.ofproto_parser.OFPMatch(
-			in_port=in_port, eth_dst=dst)
-		inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,actions)] 
- 		mod = datapath.ofproto_parser.OFPFlowMod(
-			datapath=datapath, match=match, cookie=0,
-			command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
-			priority=ofproto.OFP_DEFAULT_PRIORITY, instructions=inst)
+		parser = datapath.ofproto_parser
+
+		inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+														actions)]
+		if buffer_id:
+			mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+									priority=priority, match=match,
+									instructions=inst)
+		else:
+			mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+									match=match, instructions=inst)
 		datapath.send_msg(mod)
- 
-	def install_path(self, p, ev, src_mac, dst_mac):
+
+	def install_path(self, ev, p, ip_src, ip_dst):
 		print "install_path is called"
 		#print "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac
 		msg = ev.msg
 		datapath = msg.datapath
 		ofproto = datapath.ofproto
 		parser = datapath.ofproto_parser
+		print p
 		for sw, in_port, out_port in p:
-			print src_mac,"->", dst_mac, "via ", sw, " in_port=", in_port, " out_port=", out_port
-			match=parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-			actions=[parser.OFPActionOutput(out_port)]
-			datapath=self.datapath_list[int(sw)-1]
-			inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-			mod = datapath.ofproto_parser.OFPFlowMod(
-				datapath=datapath, match=match, idle_timeout=0, hard_timeout=0,
-				priority=1, instructions=inst)
-			datapath.send_msg(mod)
+			print ip_src,"->", ip_dst, "via ", sw, " in_port=", in_port, " out_port=", out_port
+			match_ip = parser.OFPMatch(
+		        eth_type=ether_types.ETH_TYPE_IP, 
+				ipv4_src=ip_src, 
+				ipv4_dst=ip_dst
+			)
+			print match_ip
+			match_arp = parser.OFPMatch(
+				eth_type=ether_types.ETH_TYPE_ARP, 
+				arp_spa=ip_src, 
+				arp_tpa=ip_dst
+			)
+			print match_arp
+			actions = [parser.OFPActionOutput(out_port)]
+			print self.datapath_list
+			datapath = self.datapath_list[int(sw)-1]
+			print datapath
+			self.add_flow(datapath, 1, match_ip, actions)
+			self.add_flow(datapath, 1, match_arp, actions)
+
 
 	@set_ev_cls(ofp_event.EventOFPSwitchFeatures , CONFIG_DISPATCHER)
 	def switch_features_handler(self , ev):
@@ -150,7 +162,7 @@ class ProjectController(app_manager.RyuApp):
 			command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
 			priority=0, instructions=inst)
 		datapath.send_msg(mod)
- 
+
 	@set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
 	def _packet_in_handler(self, ev):
 		msg = ev.msg
@@ -161,36 +173,52 @@ class ProjectController(app_manager.RyuApp):
  
 		pkt = packet.Packet(msg.data)
 		eth = pkt.get_protocol(ethernet.ethernet)
-		#print "eth.ethertype=", eth.ethertype
+		arp_pkt = pkt.get_protocol(arp.arp)
+		ipv6_pkt = pkt.get_protocol(ipv6.ipv6)
 
-		#avodi broadcast from LLDP
+		#avoid broadcast from LLDP
 		if eth.ethertype==35020:
 			return
+
+		if ipv6_pkt:  # Drop the IPV6 Packets.
+			match = parser.OFPMatch(eth_type=eth.ethertype)
+			actions = []
+			self.add_flow(datapath, 1, match, actions)
+			return None
 
 		dst = eth.dst
 		src = eth.src
 		dpid = datapath.id
+
 		self.mac_to_port.setdefault(dpid, {})
+
+		self.mac_to_port[dpid][src] = in_port
  
 		if src not in mymac.keys():
-			mymac[src]=( dpid,  in_port)
-			#print "mymac=", mymac
+			mymac[src] = (dpid, in_port)
+
+		out_port = ofproto.OFPP_FLOOD
 
 		if dst in mymac.keys():
-			print "anjing"
-			p = get_path(mymac[src][0], mymac[dst][0], mymac[src][1], mymac[dst][1])
-			print p
-			self.install_path(p, ev, src, dst)
-			out_port = p[0][2]
-		else:
-			out_port = ofproto.OFPP_FLOOD
-	
+			if dst in self.mac_to_port[dpid]:
+				out_port = self.mac_to_port[dpid][dst]
+				if arp_pkt:
+					ip_src = arp_pkt.src_ip  
+					ip_dst = arp_pkt.dst_ip  
+					path = get_path(mymac[src][0], mymac[dst][0],
+									mymac[src][1], mymac[dst][1])
+					reverse = get_path(mymac[dst][0], mymac[src][0], 
+									   mymac[dst][1], mymac[src][1])
+					self.install_path(ev, path, ip_src, ip_dst)
+					self.install_path(ev, reverse, ip_dst, ip_src)
+
 		actions = [parser.OFPActionOutput(out_port)]
 
 		# install a flow to avoid packet_in next time
 		if out_port != ofproto.OFPP_FLOOD:
-			match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
-		
+			match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+			self.add_flow(datapath, 1, match, actions)
+
 		data=None
 		if msg.buffer_id==ofproto.OFP_NO_BUFFER:
 			data=msg.data
@@ -200,19 +228,21 @@ class ProjectController(app_manager.RyuApp):
 			actions=actions, data=data)
 		datapath.send_msg(out)
 
-	@set_ev_cls(event.EventSwitchEnter)
-	def get_topology_data(self, ev):
-		global switches
-		switch_list = get_switch(self.topology_api_app, None)  
-		switches=[switch.dp.id for switch in switch_list]
-		self.datapath_list=[switch.dp for switch in switch_list]
-		#print "self.datapath_list=", self.datapath_list
-		print "switches=", switches
+	@set_ev_cls(event.EventSwitchEnter, MAIN_DISPATCHER)
+	def switch_enter_handler(self, event):
+		print "this is called "
+		switch = event.switch.dp
+		ofp_parser = switch.ofproto_parser
+		print switch
+		if switch.id not in switches:
+			print switch.id
+			switches.append(switch.id)
+			self.datapath_list[switch.id] = switch
 
-		links_list = get_link(self.topology_api_app, None)
-		mylinks=[(link.src.dpid,link.dst.dpid,link.src.port_no,link.dst.port_no) for link in links_list]
-		print mylinks
-		for s1,s2,port1,port2 in mylinks:
-			adjacency[s1][s2]=port1
-			adjacency[s2][s1]=port2
-			#print s1,s2,port1,port2
+	@set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
+	def link_add_handler(self, event):
+		print "link  up"
+		s1 = event.link.src
+		s2 = event.link.dst
+		adjacency[s1.dpid][s2.dpid] = s1.port_no
+		adjacency[s2.dpid][s1.dpid] = s2.port_no
