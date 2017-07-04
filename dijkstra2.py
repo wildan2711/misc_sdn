@@ -215,7 +215,7 @@ class ProjectController(app_manager.RyuApp):
             port = ofproto.OFPP_FLOOD
             self.send_arp(datapath, dst, src, dst_ip, src_ip, opcode, port)
 
-    def install_path(self, ev, p, src_ip, dst_ip, priority):
+    def install_path(self, ev, p, src_ip, dst_ip):
         print "install_path is called"
         # print "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac
         msg = ev.msg
@@ -236,8 +236,8 @@ class ProjectController(app_manager.RyuApp):
             )
             actions = [parser.OFPActionOutput(out_port)]
             datapath = self.datapath_list[int(sw)]
-            self.add_flow(datapath, priority, match_ip, actions)
-            self.add_flow(datapath, priority, match_arp, actions)
+            self.add_flow(datapath, 1, match_ip, actions)
+            self.add_flow(datapath, 1, match_arp, actions)
 
     def send_arp(self, datapath, eth_dst, eth_src, dst_ip, src_ip, opcode, port):
         ofproto = datapath.ofproto
@@ -310,10 +310,10 @@ class ProjectController(app_manager.RyuApp):
         reversed_path, d = get_path(selected_server_switch, mymac[eth.src][0],
                                   mymac[selected_server_mac][1], mymac[eth.src][1])
         # print path
-        self.install_path(ev, path, src_ip, selected_server_ip, 1)
-        self.install_path(ev, reversed_path, selected_server_ip, src_ip, 1)
-        self.install_path(ev, path[:-1], src_ip, self.virtual_ip, 2)
-        self.install_path(ev, reversed_path[1:], self.virtual_ip, src_ip, 2)
+        # self.install_path(ev, path, src_ip, selected_server_ip, 1)
+        # self.install_path(ev, reversed_path[1:], selected_server_ip, src_ip, 1)
+        self.install_path(ev, path[:-1], src_ip, self.virtual_ip)
+        self.install_path(ev, reversed_path[1:], self.virtual_ip, src_ip)
 
 
         # Setup route to server
@@ -405,6 +405,7 @@ class ProjectController(app_manager.RyuApp):
         dpid = datapath.id
 
         if dst == self.ping_mac:
+            # ping packet arrives
             self.ping_packet_handler(pkt)
             return
 
@@ -417,11 +418,12 @@ class ProjectController(app_manager.RyuApp):
         out_port = ofproto.OFPP_FLOOD
 
         if arp_pkt:
-            print dpid, pkt
+            # print dpid, pkt
             src_ip = arp_pkt.src_ip
             dst_ip = arp_pkt.dst_ip
             if arp_pkt.opcode == arp.ARP_REPLY:
                 if dst == self.controller_mac:
+                    # servers to controller
                     self.arp_table[src_ip] = src
                     match_controller = parser.OFPMatch(
                         eth_type=ether_types.ETH_TYPE_ARP,
@@ -433,6 +435,7 @@ class ProjectController(app_manager.RyuApp):
                 elif dst_ip in self.servers.values():
                     return
                 elif dst in self.mac_to_port[dpid]:
+                    # client to client routing
                     out_port = self.mac_to_port[dpid][dst]
                     path, d = get_path(mymac[src][0], mymac[dst][0], mymac[src][1], mymac[dst][1])
                     reverse, d = get_path(mymac[dst][0], mymac[src][0], mymac[dst][1], mymac[src][1])
@@ -441,13 +444,18 @@ class ProjectController(app_manager.RyuApp):
                     self.arp_table[src_ip] = src
                     self.arp_table[dst_ip] = dst
             elif dst_ip == self.virtual_ip:
+                # client to server
                 out_port = self.load_balancing_handler(ev, eth, arp_pkt, in_port)
-                # Reply ARP
+                self.arp_table[src_ip] = src
+            elif src_ip in self.servers.values():
+                # server requests mac of client, send arp reply
                 opcode = arp.ARP_REPLY
-                reply_mac = self.virtual_mac
-                # self.send_arp(datapath, src, reply_mac, src_ip, dst_ip, opcode, in_port)
-                # return
+                reply_mac = self.arp_table[dst_ip]
+                self.send_arp(datapath, src, reply_mac, src_ip, dst_ip, opcode, in_port)
+                return
         elif ipv4_pkt:
+            # install load balancing rules when icmp packet arrives
+            # still dunno why this is needed
             dst_ip = ipv4_pkt.dst
             if dst_ip == self.virtual_ip:
                 out_port = self.load_balancing_handler(ev, eth, ipv4_pkt, in_port)
@@ -455,8 +463,8 @@ class ProjectController(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        print pkt
-        if out_port != ofproto.OFPP_FLOOD and dst == mac.BROADCAST_STR:
+        # print pkt
+        if out_port != ofproto.OFPP_FLOOD and dst != mac.BROADCAST_STR:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             self.add_flow(datapath, 2, match, actions)
 
